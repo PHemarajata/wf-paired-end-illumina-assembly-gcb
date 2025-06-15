@@ -2,7 +2,7 @@ process COUNT_TOTAL_BP_INPUT_READS_SEQKIT {
 
     tag { "${meta.id}" }
     container "staphb/seqkit@sha256:8eb09a52ae932f7c25cfbb8db0df7110567087a187c7e90d46f499962d1c82c9"
-
+    stageInMode = 'copy'
     input:
     tuple val(meta), path(reads)
 

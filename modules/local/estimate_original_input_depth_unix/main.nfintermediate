@@ -25,8 +25,8 @@ process ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX {
     
     source bash_functions.sh
 
-    # With stageInMode='copy', !{bp} and !{size} now refer to physical files
-    # in the current directory, and the cat command will succeed.
+    # With stageInMode='copy' and an explicit join, !{bp} and !{size} now refer to 
+    # physical files in the current directory, and the cat command will succeed.
     bp=$(cat !{bp})
     size=$(cat !{size})
 

@@ -1,5 +1,7 @@
+#!/usr/bin/env nextflow
+nextflow.enable.dsl = 2
 //
-// Perform downsampling on input FastQ files
+// Downsample reads to a specified depth
 //
 
 /*
@@ -11,18 +13,18 @@
 //
 // MODULES: Local modules
 //
-include { ESTIMATE_GENOME_SIZE_KMC           } from "../../modules/local/estimate_genome_size_kmc/main"
-include { COUNT_TOTAL_BP_INPUT_READS_SEQTK   } from "../../modules/local/count_total_bp_input_reads_seqtk/main"
-include { COUNT_TOTAL_BP_INPUT_READS_SEQKIT  } from "../../modules/local/count_total_bp_input_reads_seqkit/main"
-include { ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX } from "../../modules/local/estimate_original_input_depth_unix/main"
-include { SUBSAMPLE_READS_TO_DEPTH_SEQTK     } from "../../modules/local/subsample_reads_to_depth_seqtk/main"
-include { SUBSAMPLE_READS_TO_DEPTH_SEQKIT    } from "../../modules/local/subsample_reads_to_depth_seqkit/main"
-include { CALCULATE_METRICS_FASTQ_SEQTK  as CALC_STATS_DOWNSAMPLE_FQ_SEQTK  } from "../../modules/local/calculate_metrics_fastq_seqtk/main"
 include { CALCULATE_METRICS_FASTQ_SEQKIT as CALC_STATS_DOWNSAMPLE_FQ_SEQKIT } from "../../modules/local/calculate_metrics_fastq_seqkit/main"
+include { CALCULATE_METRICS_FASTQ_SEQTK  as CALC_STATS_DOWNSAMPLE_FQ_SEQTK  } from "../../modules/local/calculate_metrics_fastq_seqtk/main"
+include { COUNT_TOTAL_BP_INPUT_READS_SEQKIT                                } from "../../modules/local/count_total_bp_input_reads_seqkit/main"
+include { COUNT_TOTAL_BP_INPUT_READS_SEQTK                                 } from "../../modules/local/count_total_bp_input_reads_seqtk/main"
+include { ESTIMATE_GENOME_SIZE_KMC                                         } from "../../modules/local/estimate_genome_size_kmc/main"
+include { ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX                               } from "../../modules/local/estimate_original_input_depth_unix/main"
+include { SUBSAMPLE_READS_TO_DEPTH_SEQKIT                                  } from "../../modules/local/subsample_reads_to_depth_seqkit/main"
+include { SUBSAMPLE_READS_TO_DEPTH_SEQTK                                   } from "../../modules/local/subsample_reads_to_depth_seqtk/main"
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    WORKFLOW FUNCTIONS
+    SUBWORKFLOW FUNCTIONS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
@@ -31,151 +33,143 @@ def toLower(it) {
     it.toString().toLowerCase()
 }
 
+// Check QC filechecks for a failure
+def qcfilecheck(process, qcfile, inputfile) {
+    qcfile.map{ meta, file -> [ meta, [file] ] }
+            .join(inputfile)
+            .map{ meta, qc, input ->
+                data = []
+                qc.flatten().each{ data += it.readLines() }
+
+                if ( data.any{ it.contains('FAIL') } ) {
+                    line = data.last().split('\t')
+                    log.warn("${line[1]} QC check failed during process ${process} for sample ${line.first()}")
+                } else {
+                    [ meta, input ]
+                }
+            }
+}
+
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    RUN DOWNSAMPLE WORKFLOW
+    RUN DOWNSAMPLING WORKFLOW
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 
 workflow DOWNSAMPLE {
-
     take:
-    ch_raw_reads    // channel: [ val(meta), [reads] ]
+    ch_reads // channel: [ val(meta), [ reads(R1, R2) ] ]
 
     main:
-    ch_versions             = Channel.empty()
+    ch_versions = Channel.empty()
+    ch_qc_filechecks = Channel.empty()
     ch_output_summary_files = Channel.empty()
+    ch_total_bp = Channel.empty()
 
-    // Handle too much raw data, subsample the input FastQ files
-    // Only calculate genome size if genome_size is unknown or a depth given to subsample
-    if (!params.genome_size && params.depth > 0) {
-        // Estimate the genome size from the input R1 FastQ file
+    if (params.subsample) {
+        log.info "Estimating if the input exceeds ${params.depth}x"
+
+        // PROCESS: run KMC to get k-mer counts for genome size estimation
         ESTIMATE_GENOME_SIZE_KMC (
-            ch_raw_reads
+            ch_reads
         )
-
         ch_versions = ch_versions.mix(ESTIMATE_GENOME_SIZE_KMC.out.versions)
 
-    } else {
-        if (params.depth <= 0) {
-            log.info("Depth is set to <= 0x. No subsampling to perform and therefore no genome size estimation required.")
-        } else {
-            log.info("Using the user-input genome size of ${params.genome_size}bp")
-        }
-        // pass the genome_size val onto the next depth channel
-        // Skip genome size estimation based on user input, but
-        //  still consider downsampling with specified genome_size input value
-    }
-
-    // Only if specified depth is less than wanted depth, subsample infiles
-    if (params.depth > 0) {
-        log.info("Estimating if the input exceeds ${params.depth}x")
-
-        // Subsample with seqtk
-        if ( toLower(params.subsample_tool) == "seqtk" ) {
-            
-            // Use the genome size to figure out the expected depth
-            COUNT_TOTAL_BP_INPUT_READS_SEQTK (
-                ch_raw_reads
-            )
-
-            ch_versions = ch_versions.mix(COUNT_TOTAL_BP_INPUT_READS_SEQTK.out.versions)
-
-            ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX (
-                COUNT_TOTAL_BP_INPUT_READS_SEQTK.out.input_total_bp
-                        .join(ESTIMATE_GENOME_SIZE_KMC.out.genome_size)
-            )
-
-            ch_versions = ch_versions.mix(ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.versions)
-
-            SUBSAMPLE_READS_TO_DEPTH_SEQTK (
-                ch_raw_reads.join(ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.fraction_of_reads_to_use)
-            )
-
-            ch_versions = ch_versions.mix(SUBSAMPLE_READS_TO_DEPTH_SEQTK.out.versions)
-
-            // Collect subsampled reads
-            ch_downsampled_reads = SUBSAMPLE_READS_TO_DEPTH_SEQTK.out.reads
-
-            // PROCESS: Calculate downsampled FastQ metrics for each sample with Seqtk
-            CALC_STATS_DOWNSAMPLE_FQ_SEQTK (
-                SUBSAMPLE_READS_TO_DEPTH_SEQTK.out.reads,
-                "Downsampled_Reads"
-            )
-
-            ch_versions = ch_versions.mix(CALC_STATS_DOWNSAMPLE_FQ_SEQTK.out.versions)
-
-            // Collect cleaned read/base summaries and concatenate into one file
-            ch_downsampled_reads_metrics_summary = CALC_STATS_DOWNSAMPLE_FQ_SEQTK.out.output
-                                                        .collectFile(
-                                                            name:       "Summary.Downsampled_Reads.Metrics.tsv",
-                                                            keepHeader: true,
-                                                            sort:       { file -> file.text },
-                                                            storeDir:   "${params.outdir}/Summaries"
-                                                        )
-
-            ch_output_summary_files = ch_output_summary_files.mix(ch_downsampled_reads_metrics_summary)
-
-        // Subsample with SeqKit
-        } else if ( toLower(params.subsample_tool) == "seqkit" ) {
-
-            // // Use the genome size to figure out the expected depth
-            // CALC_STATS_INPUT_FQ_SEQKIT (
-            //     ch_raw_reads,
-            //     "Input_for_Subsampling_Reads"
-            // )
-            // ch_versions = ch_versions.mix(CALC_STATS_INPUT_FQ_SEQKIT.out.versions)
-
+        if ( toLower(params.subsample_tool) == "seqkit" ) {
+            // PROCESS: Calculate total bp for each sample with SeqKit
             COUNT_TOTAL_BP_INPUT_READS_SEQKIT (
-                ch_raw_reads
+                ch_reads
             )
-
             ch_versions = ch_versions.mix(COUNT_TOTAL_BP_INPUT_READS_SEQKIT.out.versions)
-
-            ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX (
-                COUNT_TOTAL_BP_INPUT_READS_SEQKIT.out.input_total_bp
-                        .join(ESTIMATE_GENOME_SIZE_KMC.out.genome_size)
+            ch_total_bp = COUNT_TOTAL_BP_INPUT_READS_SEQKIT.out.input_total_bp
+        } else {
+            // PROCESS: Calculate total bp for each sample with Seqtk
+            COUNT_TOTAL_BP_INPUT_READS_SEQTK (
+                ch_reads
             )
+            ch_versions = ch_versions.mix(COUNT_TOTAL_BP_INPUT_READS_SEQTK.out.versions)
+            ch_total_bp = COUNT_TOTAL_BP_INPUT_READS_SEQTK.out.output
+        }
+        
+        // --- FIX: Explicitly join the two channels before passing to the next process ---
+        ch_for_depth_estimation = ch_total_bp.join(ESTIMATE_GENOME_SIZE_KMC.out.genome_size)
 
-            ch_versions = ch_versions.mix(ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.versions)
+        // PROCESS: use total bp and est. genome size to calc initial depth
+        ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX (
+            ch_for_depth_estimation
+        )
+        ch_versions = ch_versions.mix(ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.versions)
 
-            // Subsample with seqkit
-            SUBSAMPLE_READS_TO_DEPTH_SEQKIT (
-                ch_raw_reads.join(ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.fraction_of_reads_to_use)
+        // Split reads into two channels: one for subsampling and one to skip
+        ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.fraction
+            .join(ch_reads)
+            .branch { meta, fraction, reads ->
+                // FIX: This block now uses the correct branch syntax
+                def ff = new File(fraction.toString())
+                def is_above = false
+                if (ff.exists() && ff.size() > 0) {
+                    def fraction_val = ff.getText('UTF-8').toFloat()
+                    if (fraction_val < 1.0) {
+                        is_above = true
+                    }
+                }
+                
+                above_depth: is_above
+                below_depth: !is_above
+            }
+            .set { ch_split_subsample }
+
+        // Re-add the fraction value to the above_depth channel, as it's consumed by branch
+        ch_subsample_input = ch_split_subsample.above_depth.join(ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.fraction)
+                                                          .map { meta, reads, frac_file -> [meta, reads, frac_file] }
+
+        // Subsample reads that are above the desired depth
+        if ( toLower(params.subsample_tool) == "seqkit" ) {
+            SUBSAMPLE_READS_TO_DEPTH_SEQKIT(
+                ch_subsample_input
             )
-
             ch_versions = ch_versions.mix(SUBSAMPLE_READS_TO_DEPTH_SEQKIT.out.versions)
 
-            // Collect subsampled reads
-            ch_downsampled_reads = SUBSAMPLE_READS_TO_DEPTH_SEQKIT.out.reads
+            ch_subsampled_reads_summary = SUBSAMPLE_READS_TO_DEPTH_SEQKIT.out.summary
+                                                .collectFile(
+                                                    name:       "Summary.Subsampled_Reads.tsv",
+                                                    keepHeader: true,
+                                                    sort:       true,
+                                                    storeDir:   "${params.outdir}/Summaries"
+                                                )
+            ch_output_summary_files = ch_output_summary_files.mix(ch_subsampled_reads_summary)
 
-            // PROCESS: Calculate downsampled FastQ metrics for each sample with SeqKit
-            CALC_STATS_DOWNSAMPLE_FQ_SEQKIT (
-                SUBSAMPLE_READS_TO_DEPTH_SEQKIT.out.reads,
-                "Downsampled_Reads"
+            ch_final_reads = SUBSAMPLE_READS_TO_DEPTH_SEQKIT.out.subsampled_reads
+                                .mix(ch_split_subsample.below_depth.map{ meta, reads -> [ meta, reads ] })
+
+            CALC_STATS_DOWNSAMPLE_FQ_SEQKIT(
+                ch_final_reads,
+                "Subsampled_Reads"
             )
-
             ch_versions = ch_versions.mix(CALC_STATS_DOWNSAMPLE_FQ_SEQKIT.out.versions)
+            ch_downsample_metrics = CALC_STATS_DOWNSAMPLE_FQ_SEQKIT.out.output
+                                        .collectFile(
+                                            name:       "Summary.Subsampled_Reads.Metrics.tsv",
+                                            keepHeader: true,
+                                            sort:       true,
+                                            storeDir:   "${params.outdir}/Summaries"
+                                        )
+            ch_output_summary_files = ch_output_summary_files.mix(ch_downsample_metrics)
 
-            // Collect cleaned read/base summaries and concatenate into one file
-            ch_downsampled_reads_metrics_summary = CALC_STATS_DOWNSAMPLE_FQ_SEQKIT.out.output
-                                                        .collectFile(
-                                                            name:       "Summary.Downsampled_Reads.Metrics.tsv",
-                                                            keepHeader: true,
-                                                            sort:       { file -> file.text },
-                                                            storeDir:   "${params.outdir}/Summaries"
-                                                        )
-
-            ch_output_summary_files = ch_output_summary_files.mix(ch_downsampled_reads_metrics_summary)
+        } else {
+            SUBSAMPLE_READS_TO_DEPTH_SEQTK(
+                ch_subsample_input
+            )
+            ch_versions = ch_versions.mix(SUBSAMPLE_READS_TO_DEPTH_SEQTK.out.versions)
+            ch_final_reads = SUBSAMPLE_READS_TO_DEPTH_SEQTK.out.subsampled_reads
+                                .mix(ch_split_subsample.below_depth.map{ meta, reads -> [ meta, reads ] })
         }
     } else {
-        // Skip subsampling and pass raw reads to PhiX removal
-        // Collect raw reads
-        ch_downsampled_reads = ch_raw_reads
+        ch_final_reads = ch_reads
     }
 
     emit:
-    reads                = ch_downsampled_reads    // channel: [ val(meta), [reads] ]
+    reads                = ch_final_reads
     versions             = ch_versions
     output_summary_files = ch_output_summary_files
 }

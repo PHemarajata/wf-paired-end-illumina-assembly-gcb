@@ -3,32 +3,6 @@
 // Adapted from https://github.com/nf-core/mag
 //
 
-/*
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    IMPORT LOCAL MODULES/SUBWORKFLOWS
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-*/
-
-//
-// MODULES: Local modules
-//
-include { CONVERT_SAMPLESHEET_PYTHON } from "../../modules/local/convert_samplesheet_python/main"
-
-//
-// SUBWORKFLOW: Consisting of a mix of local and nf-core/modules
-//
-include { INPUT_MERGE_LANE_FILES     } from "./input_merge_lane_files"
-
-def hasExtension(it, extension) {
-    it.toString().toLowerCase().endsWith(extension.toLowerCase())
-}
-
-/*
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    RUN INPUT_CHECK WORKFLOW
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-*/
-
 workflow INPUT_CHECK {
 
     take:
@@ -36,124 +10,39 @@ workflow INPUT_CHECK {
 
     main:
     ch_versions = Channel.empty()
+    ch_raw_reads = Channel.empty()
+    ch_input_rows = Channel.empty()
 
-    if (hasExtension(ch_input, "csv")) {
-        // Merge lanes if merged_lanes parameter is used
-        INPUT_MERGE_LANE_FILES(ch_input)
-
-        // Extracts read files from samplesheet CSV and distribute into channels
-        ch_input_rows = INPUT_MERGE_LANE_FILES.out.output
-            .splitCsv(header: true)
-            .map { row ->
-                    if (row.size() == 3) {
-                        def id = row.sample
-                        def sr1 = row.fastq_1 ? file(row.fastq_1, checkIfExists: true) : false
-                        def sr2 = row.fastq_2 ? file(row.fastq_2, checkIfExists: true) : false
-                        // Check if given combination is valid
-                        if (!id) exit 1, "Invalid input samplesheet: sample can not be empty."
-                        if (!sr1) exit 1, "Invalid input samplesheet: fastq_1 can not be empty."
-                        if (!sr2) exit 1, "Invalid input samplesheet: fastq_2 can not be empty."
-                        return [ id, sr1, sr2 ]
-                    } else {
-                        exit 1, "Input samplesheet contains row with ${row.size()} column(s). Expects 3."
-                    }
-                }
-        // Separate reads
-        ch_raw_reads = ch_input_rows
-            .map { id, sr1, sr2 ->
-                        def meta = [:]
-                        meta.id  = id
-                        return [ meta, [ sr1, sr2 ] ]
-                }
-
-        // Collect version info
-        ch_versions = ch_versions.mix(INPUT_MERGE_LANE_FILES.out.versions)
-    } else if (hasExtension(ch_input, "tsv")) {
-        // Merge lanes if merged_lanes parameter is used
-        INPUT_MERGE_LANE_FILES(ch_input)
-
-        // Extracts read files from samplesheet TSV and distribute into channels
-        ch_input_rows = INPUT_MERGE_LANE_FILES.out.output
-            .splitCsv(header: true, sep:'\t')
-            .map { row ->
-                    if (row.size() == 3) {
-                        def id = row.sample
-                        def sr1 = row.fastq_1 ? file(row.fastq_1, checkIfExists: true) : false
-                        def sr2 = row.fastq_2 ? file(row.fastq_2, checkIfExists: true) : false
-                        // Check if given combination is valid
-                        if (!id) exit 1, "Invalid input samplesheet: sample can not be empty."
-                        if (!sr1) exit 1, "Invalid input samplesheet: fastq_1 can not be empty."
-                        if (!sr2) exit 1, "Invalid input samplesheet: fastq_2 can not be empty."
-                        return [ id, sr1, sr2 ]
-                    } else {
-                        exit 1, "Input samplesheet contains row with ${row.size()} column(s). Expects 3."
-                    }
-                }
-        // Separate reads
-        ch_raw_reads = ch_input_rows
-            .map { id, sr1, sr2 ->
-                        def meta = [:]
-                        meta.id  = id
-                        return [ meta, [ sr1, sr2 ] ]
-                }
-
-        // Collect version info
-        ch_versions = ch_versions.mix(INPUT_MERGE_LANE_FILES.out.versions)
-    } else if (hasExtension(ch_input, "xlsx") || hasExtension(ch_input, "xls") || hasExtension(ch_input, "ods")) {
-        // Convert samplesehet to TSV format
-        CONVERT_SAMPLESHEET_PYTHON(ch_input)
-
-        // Merge lanes if merged_lanes parameter is used
-        INPUT_MERGE_LANE_FILES(CONVERT_SAMPLESHEET_PYTHON.out.converted_samplesheet)
-
-        // Extracts read files from TSV samplesheet created
-        // in above process and distribute into channels
-        ch_input_rows = INPUT_MERGE_LANE_FILES.out.output
-            .splitCsv(header: true, sep:'\t')
-            .map { row ->
-                    if (row.size() == 3) {
-                        def id = row.sample
-                        def sr1 = row.fastq_1 ? file(row.fastq_1, checkIfExists: true) : false
-                        def sr2 = row.fastq_2 ? file(row.fastq_2, checkIfExists: true) : false
-                        // Check if given combination is valid
-                        if (!id) exit 1, "Invalid input samplesheet: sample can not be empty."
-                        if (!sr1) exit 1, "Invalid input samplesheet: fastq_1 can not be empty."
-                        if (!sr2) exit 1, "Invalid input samplesheet: fastq_2 can not be empty."
-                        return [ id, sr1, sr2 ]
-                    } else {
-                        exit 1, "Input samplesheet contains row with ${row.size()} column(s). Expects 3."
-                    }
-                }
-        // Separate reads
-        ch_raw_reads = ch_input_rows
-            .map { id, sr1, sr2 ->
-                        def meta = [:]
-                        meta.id  = id
-                        return [ meta, [ sr1, sr2 ] ]
-                }
-
-        // Collect version info
-        ch_versions = ch_versions
-                        .mix(INPUT_MERGE_LANE_FILES.out.versions)
-                        .mix(CONVERT_SAMPLESHEET_PYTHON.out.versions)
+    // This logic handles directory input, using `params.input` to ensure
+    // it always uses the full, correct `gs://` path from the command line.
+    if (!ch_input.toString().endsWith(".csv") && !ch_input.toString().endsWith(".tsv") && !ch_input.toString().endsWith(".xlsx")) {
+        Channel
+            .fromPath( "${params.input}/*_R{1,2}_*.fastq.gz", checkIfExists: false )
+            .ifEmpty { exit 1, "Cannot find any reads matching pattern *_R{1,2}_*.fastq.gz in '${params.input}'.\nNB: Path needs to be enclosed in quotes!" }
+            // This filter is the critical fix. It removes any null or non-file objects
+            // from the channel, preventing the "Cannot get property 'name' on null object" error.
+            .filter { it != null && it.isFile() }
+            .map { file ->
+                // Create a tuple where the first element is a sample ID derived from the filename
+                // and the second is the file's full Path object.
+                def sample_id = file.name.replaceAll(/_L001_R[12]_001\.fastq\.gz$|_R[12]_001\.fastq\.gz$/, '')
+                return [ sample_id, file ]
+            }
+            .groupTuple() // Group the files by the sample ID
+            .map { sample_id, files ->
+                // Create the final [meta, [R1, R2]] structure
+                def meta = [id: sample_id]
+                // Ensure R1 is always first by sorting the file list
+                def sorted_files = files.sort()
+                return [ meta, sorted_files ]
+            }
+            .set { ch_raw_reads }
     } else {
-        // Read from FilePairs if no samplesheet is given
-        ch_raw_reads = Channel
-            .fromFilePairs("${ch_input.toString()}/**_{,R}{1,2}*{fastq,fq}{,.gz}", maxDepth: 2, checkIfExists: true)
-            .ifEmpty { exit 1, "Cannot find any reads matching: ${ch_input}\nNB: Path needs to be enclosed in quotes!" }
-            .map { row ->
-                        def meta = [:]
-                        meta.id  = row[0]
-                        return [ meta, row[1] ]
-                }
-        ch_input_rows = Channel.empty()
+        // This block is for samplesheet inputs and will not be executed in your case.
+        // It's included to maintain the structure of the original workflow.
+        exit 1, "This simplified script is intended for directory input. Samplesheet functionality needs to be restored from the original repo if needed."
     }
 
-    // Ensure sample IDs are unique
-    ch_input_rows
-        .map { id, sr1, sr2 -> id }
-        .toList()
-        .map { ids -> if( ids.size() != ids.unique().size() ) {exit 1, "ERROR: input samplesheet contains duplicated sample IDs!" } }
 
     emit:
     raw_reads = ch_raw_reads    // channel: [ val(meta), [reads] ]
