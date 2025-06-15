@@ -104,25 +104,24 @@ workflow DOWNSAMPLE {
         ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.fraction
             .join(ch_reads)
             .branch { meta, fraction, reads ->
-                // FIX: This block now uses the correct branch syntax
-                def ff = new File(fraction.toString())
-                def is_above = false
-                if (ff.exists() && ff.size() > 0) {
-                    def fraction_val = ff.getText('UTF-8').toFloat()
-                    if (fraction_val < 1.0) {
-                        is_above = true
-                    }
-                }
-                
-                above_depth: is_above
-                below_depth: !is_above
-            }
+    def ff = new File(fraction.toString())
+    def is_above = false
+    if (ff.exists() && ff.size() > 0) {
+        def fraction_val = ff.getText('UTF-8').toFloat()
+        if (fraction_val < 1.0) {
+            is_above = true
+        }
+    }
+    above_depth: is_above
+        return [meta, reads]
+    below_depth: true
+        return [meta, reads]
+}
             .set { ch_split_subsample }
 
         // Re-add the fraction value to the above_depth channel, as it's consumed by branch
-        ch_subsample_input = ch_split_subsample.above_depth.join(ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.fraction)
-                                                          .map { meta, reads, frac_file -> [meta, reads, frac_file] }
-
+        ch_subsample_input = ch_split_subsample.above_depth
+    .join(ESTIMATE_ORIGINAL_INPUT_DEPTH_UNIX.out.fraction)
         // Subsample reads that are above the desired depth
         if ( toLower(params.subsample_tool) == "seqkit" ) {
             SUBSAMPLE_READS_TO_DEPTH_SEQKIT(
